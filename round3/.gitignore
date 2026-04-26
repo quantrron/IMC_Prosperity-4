@@ -1,0 +1,4 @@
+ver * logs/
+CONTEXT.md
+__pycache__/
+*.pyc
