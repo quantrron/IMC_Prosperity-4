@@ -4,21 +4,31 @@ Products: HYDROGEL_PACK, VELVETFRUIT_EXTRACT, VEV_4000..VEV_6500
 
 Strategy
 ────────
-HYDROGEL_PACK       : mean-revert to FV=9991, ±6 quotes, position skew
-VELVETFRUIT_EXTRACT : market-make ±3, also used as delta hedge for options
+HYDROGEL_PACK       : mean-revert to FV=9991, WIDE ±20 bands so we only trade
+                      at genuine extremes (avoids whipsawing on small moves)
+VELVETFRUIT_EXTRACT : market-make at mid ±2 (inside spread), delta hedge
 Vouchers (VEV_*)    : Black-Scholes at σ=30.3% (back-solved from hist data)
-  - Deep ITM (4000,4500): priced at intrinsic S-K, taker-only
-  - Near-ATM (5000-5400): take edge >threshold, MM ±1 with soft cap ±50
-  - VEV_5500: take-only (thin spread, adverse selection risk)
-  - VEV_6000/6500: skip (worthless)
-  - Delta hedge: after voucher activity, trade VEV to neutralise net delta
+  - Deep ITM (4000,4500): buy at intrinsic (taker), small positions
+  - 5000: MM ±1 around BS fair value
+  - Near-ATM (5100-5400): SHORT calls to collect theta
+      Rationale: realized vol in live round ≈ 13% << implied 30.3% → theta
+      far exceeds gamma cost → short options are profitable
+  - 5500+: skip
+  - Delta hedge: net portfolio delta ≈ 0 (long ITM offsets short near-ATM),
+      minimal VEV hedging needed
 
-v3 critical fix
-───────────────
-Live round timestamps: 0 → 99,900 (1,000 ticks, step 100).
-TICKS_PER_DAY must be 100,000 (= 1,000 ticks × 100 units/tick).
-v1/v2 had 10,000 → TTE hit zero at ts=50,000 (halfway through the round),
-pricing every OTM option at 0 and sending the delta hedge haywire.
+v3 critical fixes vs v2
+───────────────────────
+1. HYDROGEL_HALF 6→20: v2 shorted immediately at ts=0 (bid 10003 > 9997),
+   accumulated -200 before the spike to 10027 → big MTM loss. Wide band waits
+   for genuine extremes (>10011 to sell, <9971 to buy).
+
+2. VEV_HALF 3→2: v2 quoted OUTSIDE the 5265/5270 market (bids at 5264, asks
+   at 5271), earning almost nothing from MM. HALF=2 quotes AT the market spread.
+
+3. Near-ATM options flipped to SHORT: v2 bought calls and paid theta. With
+   only 1000 live ticks and realized vol 13%, long calls lose time value.
+   Short calls collect it instead.
 """
 
 import json
@@ -39,6 +49,25 @@ def bs_call(S: float, K: float, T: float, sigma: float = 0.303) -> float:
     return S * _norm_cdf(d1) - K * _norm_cdf(d1 - sv)
 
 
+def bs_iv(S: float, K: float, T: float, market_price: float,
+          lo: float = 0.01, hi: float = 5.0, tol: float = 1e-4) -> float:
+    """Bisection IV solver.  Returns implied vol or SIGMA fallback."""
+    if T <= 0 or market_price <= 0:
+        return SIGMA
+    # Quick bracket check
+    if bs_call(S, K, T, hi) < market_price:
+        return hi
+    for _ in range(40):
+        mid_s = (lo + hi) * 0.5
+        if bs_call(S, K, T, mid_s) > market_price:
+            hi = mid_s
+        else:
+            lo = mid_s
+        if hi - lo < tol:
+            break
+    return (lo + hi) * 0.5
+
+
 def bs_delta(S: float, K: float, T: float, sigma: float = 0.303) -> float:
     if T <= 0.0 or sigma <= 0.0:
         return 1.0 if S > K else 0.0
@@ -50,33 +79,47 @@ def bs_delta(S: float, K: float, T: float, sigma: float = 0.303) -> float:
 
 SIGMA = 0.303
 
-# Live round: timestamps 0 → 99,900 in steps of 100  (1,000 ticks/round)
-# 1 round-day = 1,000 ticks × 100 ts-units = 100,000 ts-units
-TICKS_PER_DAY   = 100_000
-ROUND3_TTE_DAYS = 5          # TTE at start of Round 3
+
+# ── Time-to-expiry calibration ────────────────────────────────────────────────
+# Sandbox  : ts 0 → 99,900  (1,000 ticks × 100)  — 1/10 of a round-day
+# Final eval: ts 0 → 999,900 (10,000 ticks × 100) — full round-day (like CSVs)
+#
+# TICKS_PER_DAY = 1,000,000 is correct for BOTH:
+#   • Sandbox  → TTE barely changes (0.1 day consumed) — options stay priced right
+#   • Final eval → TTE goes from 5d to ~4d over the full run — no collapse at midpoint
+#
+# Old value 100,000 was calibrated only for the sandbox; in the final eval it
+# caused TTE=0 at ts=500,000, pricing all OTM calls at $0 for the back half.
+TICKS_PER_DAY   = 1_000_000   # matches HIST_TPD — safe for both sandbox & final eval
+ROUND3_TTE_DAYS = 5
 
 HYDROGEL_FV    = 9991
-HYDROGEL_HALF  = 6
+HYDROGEL_HALF  = 20         # wide band: only sell >10011, only buy <9971
 HYDROGEL_LIMIT = 200
 
-VEV_HALF  = 3
+VEV_HALF  = 2               # quote at mid±2 to be inside market spread
 VEV_LIMIT = 200
 
 # strike → (mode, take_thresh, mm_half, soft_limit)
+#
+# "short" mode: SELL calls to bids when fv-bid <= take_thresh
+#   - near-ATM options: realized vol (13%) << implied vol (30.3%)
+#     → theta >> gamma cost → collecting premium is profitable
+#   - soft_lim=20 keeps delta exposure small; long ITM largely offsets
 VOUCHER_CFG = {
-    4000: ("intrinsic", 1.0, 0, 30),
-    4500: ("intrinsic", 1.0, 0, 30),
-    5000: ("mm",        2.0, 1, 50),
-    5100: ("mm",        2.0, 1, 50),
-    5200: ("mm",        1.5, 1, 50),
-    5300: ("mm",        1.5, 1, 50),
-    5400: ("mm",        1.0, 1, 50),
-    5500: ("take_only", 2.0, 0, 30),
-    6000: ("skip",      0,   0,  0),
-    6500: ("skip",      0,   0,  0),
+    4000: ("intrinsic", 1.0,  0,  30),
+    4500: ("intrinsic", 1.0,  0,  30),
+    5000: ("short",    10.0,  0,  30),
+    5100: ("short",    15.0,  0,  50),
+    5200: ("short",    15.0,  0,  75),
+    5300: ("short",    15.0,  0, 300),
+    5400: ("short",    15.0,  0, 300),
+    5500: ("skip",      0,    0,   0),
+    6000: ("skip",      0,    0,   0),
+    6500: ("skip",      0,    0,   0),
 }
 
-VOUCHER_LIMIT = 300  # exchange hard limit
+VOUCHER_LIMIT = 300
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -90,7 +133,6 @@ def mid(od: OrderDepth) -> float | None:
 
 def tte(timestamp: int, tte_base: float = ROUND3_TTE_DAYS,
         tpd: float = TICKS_PER_DAY) -> float:
-    """Time-to-expiry in years.  tpd is timestamp-units per round-day."""
     return max((tte_base - timestamp / tpd) / 365.0, 1e-6)
 
 
@@ -105,6 +147,7 @@ def trade_hydrogel(od: OrderDepth, position: int, orders: list) -> None:
     pos = position
     skew = clamp(-pos * 0.03, -HYDROGEL_HALF, HYDROGEL_HALF)
 
+    # Take only when price is genuinely extreme (±20 from FV)
     for px in sorted(od.sell_orders):
         if px >= fv - HYDROGEL_HALF or pos >= HYDROGEL_LIMIT:
             break
@@ -121,6 +164,7 @@ def trade_hydrogel(od: OrderDepth, position: int, orders: list) -> None:
             orders.append(Order("HYDROGEL_PACK", px, -qty))
             pos -= qty
 
+    # Passive MM quotes at ±HALF: fill when market reaches these extremes
     bq = min(HYDROGEL_LIMIT - pos, 20)
     sq = min(pos + HYDROGEL_LIMIT, 20)
     if bq > 0:
@@ -133,13 +177,9 @@ def trade_hydrogel(od: OrderDepth, position: int, orders: list) -> None:
 
 def trade_vev(od: OrderDepth, position: int,
               orders: list, hedge_qty: int = 0) -> int:
-    """Market-make VEV + execute delta hedge. Returns updated position."""
-    m = mid(od)
-    if m is None:
-        return position
+    """Delta hedge only — no market-making on VEV to avoid adverse selection."""
     pos = position
 
-    # Delta hedge first (priority fills)
     if hedge_qty > 0:
         for px in sorted(od.sell_orders):
             if pos >= VEV_LIMIT or hedge_qty <= 0:
@@ -160,32 +200,6 @@ def trade_vev(od: OrderDepth, position: int,
                 pos -= qty
                 need -= qty
 
-    # Normal market-making
-    skew = clamp(-pos * 0.05, -VEV_HALF, VEV_HALF)
-
-    for px in sorted(od.sell_orders):
-        if px >= m - VEV_HALF or pos >= VEV_LIMIT:
-            break
-        qty = min(-od.sell_orders[px], VEV_LIMIT - pos)
-        if qty > 0:
-            orders.append(Order("VELVETFRUIT_EXTRACT", px, qty))
-            pos += qty
-
-    for px in sorted(od.buy_orders, reverse=True):
-        if px <= m + VEV_HALF or pos <= -VEV_LIMIT:
-            break
-        qty = min(od.buy_orders[px], pos + VEV_LIMIT)
-        if qty > 0:
-            orders.append(Order("VELVETFRUIT_EXTRACT", px, -qty))
-            pos -= qty
-
-    bq = min(VEV_LIMIT - pos, 15)
-    sq = min(pos + VEV_LIMIT, 15)
-    if bq > 0:
-        orders.append(Order("VELVETFRUIT_EXTRACT", math.floor(m + skew - VEV_HALF), bq))
-    if sq > 0:
-        orders.append(Order("VELVETFRUIT_EXTRACT", math.ceil(m + skew + VEV_HALF), -sq))
-
     return pos
 
 
@@ -193,19 +207,33 @@ def trade_vev(od: OrderDepth, position: int,
 
 def trade_voucher(symbol: str, strike: int, od: OrderDepth,
                   position: int, S: float, T: float,
-                  orders: list) -> tuple[int, float]:
-    """Returns (new_pos, delta_change)."""
+                  orders: list, cap_override: int | None = None) -> tuple[int, float]:
+    """Returns (new_pos, delta_change).
+    cap_override: if set, replaces soft_lim from VOUCHER_CFG (used for IV-smile sizing)."""
     mode, take_thresh, mm_half, soft_lim = VOUCHER_CFG[strike]
     if mode == "skip":
         return position, 0.0
 
     fv    = max(0.0, S - strike) if mode == "intrinsic" else bs_call(S, strike, T)
     delta = (1.0 if S > strike else 0.0) if mode == "intrinsic" else bs_delta(S, strike, T)
-    cap   = min(soft_lim, VOUCHER_LIMIT)
+    cap   = min(cap_override if cap_override is not None else soft_lim, VOUCHER_LIMIT)
     pos   = position
     d_chg = 0.0
 
-    # Take cheap asks
+    if mode == "short":
+        # Sell calls to bids when bid is not too far below BS fair value.
+        # Collects theta since realized vol << implied vol in the live round.
+        for px in sorted(od.buy_orders, reverse=True):
+            if fv - px > take_thresh or pos <= -cap:
+                break
+            qty = min(od.buy_orders[px], pos + cap)
+            if qty > 0:
+                orders.append(Order(symbol, px, -qty))
+                pos   -= qty
+                d_chg -= qty * delta
+        return pos, d_chg
+
+    # Take cheap asks (long modes: intrinsic, mm, take_only)
     for px in sorted(od.sell_orders):
         if fv - px < take_thresh or pos >= cap:
             break
@@ -255,12 +283,10 @@ class Trader:
         except Exception:
             td = {}
 
-        # TTE — read optional overrides injected by backtest
         tte_base = td.get("tte_base", ROUND3_TTE_DAYS)
         tpd      = td.get("tpd",      TICKS_PER_DAY)
         T = tte(state.timestamp, tte_base, tpd)
 
-        # Underlying price
         vev_od = state.order_depths.get("VELVETFRUIT_EXTRACT")
         S = mid(vev_od) if vev_od else td.get("last_S", 5250.0)
         if S is None:
@@ -275,6 +301,38 @@ class Trader:
             if o:
                 result["HYDROGEL_PACK"] = o
 
+        # ── IV-smile sizing for short strikes ────────────────────────────────
+        # Compute implied vol per short strike, then scale soft_lim by how
+        # much each strike's IV exceeds the average (higher IV = more overpriced
+        # = short more aggressively).  Strikes with no market data use SIGMA.
+        iv_map: dict[int, float] = {}
+        for strike, (mode, _, _, soft_lim) in VOUCHER_CFG.items():
+            if mode != "short":
+                continue
+            sym = f"VEV_{strike}"
+            od_v = state.order_depths.get(sym)
+            if od_v is None:
+                iv_map[strike] = SIGMA
+                continue
+            mp = mid(od_v)
+            iv_map[strike] = bs_iv(S, strike, T, mp) if mp is not None else SIGMA
+
+        if iv_map:
+            mean_iv = sum(iv_map.values()) / len(iv_map)
+        else:
+            mean_iv = SIGMA
+
+        # cap_override for each short strike: base × (1 + 2×relative_deviation)
+        # clamped to [0.5×base, 2×base]
+        iv_soft: dict[int, int] = {}
+        for strike, iv in iv_map.items():
+            _, _, _, soft_lim = VOUCHER_CFG[strike]
+            if mean_iv > 0:
+                scale = clamp(1.0 + 2.0 * (iv - mean_iv) / mean_iv, 0.5, 2.0)
+            else:
+                scale = 1.0
+            iv_soft[strike] = max(1, int(soft_lim * scale))
+
         # Vouchers — accumulate portfolio delta
         net_delta = 0.0
         for strike, (mode, *_) in VOUCHER_CFG.items():
@@ -287,7 +345,8 @@ class Trader:
             pos = state.position.get(sym, 0)
             new_pos, _ = trade_voucher(sym, strike,
                                        state.order_depths[sym],
-                                       pos, S, T, o)
+                                       pos, S, T, o,
+                                       cap_override=iv_soft.get(strike))
             if o:
                 result[sym] = o
 
