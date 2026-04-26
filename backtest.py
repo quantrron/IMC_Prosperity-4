@@ -1,235 +1,189 @@
 """
-Backtester for Round 3 trader using historical price CSVs.
+Backtester for Round 3 using historical price CSVs.
 
-Fill model (mirrors Prosperity rules):
-  - Our BUY  order at price P fills against market asks with price <= P
-  - Our SELL order at price P fills against market bids with price >= P
-  - Volume filled = min(our qty, available market volume at that level)
+Key differences from live round:
+  Historical CSV : timestamps 0 → 999,900  (10,000 ticks/day, step 100)
+  Live round     : timestamps 0 →  99,900  ( 1,000 ticks/round, step 100)
 
-P&L:
-  - Realized: cash flow from every fill (buy = -cash, sell = +cash)
-  - Mark-to-market: open position * mid at end of each day
-  - Total = realized + unrealized (mark-to-market)
+Historical days and their starting TTE:
+  Day 0 (tutorial) : TTE = 8 days
+  Day 1 (round 1)  : TTE = 7 days
+  Day 2 (round 2)  : TTE = 6 days
+  Live round 3     : TTE = 5 days  ← what trader.py is tuned for
+
+Fill model: resting-order price improvement (standard limit order book).
+  Our BUY  at P fills against market asks ≤ P, at the market ask price.
+  Our SELL at P fills against market bids ≥ P, at the market bid price.
 """
 
-import csv
-import json
-import math
+import csv, json, math
 from collections import defaultdict
 from datamodel import Order, OrderDepth, TradingState
-from trader import Trader
+from trader import Trader, bs_call, bs_delta, SIGMA
 
+# Historical data has 10x more ts-units per day than the live round
+HIST_TPD = 1_000_000   # timestamp-units per historical day (10,000 ticks × 100)
+TTE_BY_DAY = {0: 8, 1: 7, 2: 6}
 
-# ── Load historical data ───────────────────────────────────────────────────────
+LIMITS = {
+    "HYDROGEL_PACK": 200,
+    "VELVETFRUIT_EXTRACT": 200,
+    **{f"VEV_{k}": 300 for k in [4000,4500,5000,5100,5200,5300,5400,5500,6000,6500]},
+}
+
 
 def load_prices(day: int) -> dict[int, dict[str, dict]]:
-    """Returns {timestamp: {product: row_dict}}"""
-    path = f"ROUND_3/prices_round_3_day_{day}.csv"
     data: dict[int, dict[str, dict]] = defaultdict(dict)
-    with open(path) as f:
-        reader = csv.DictReader(f, delimiter=";")
-        for row in reader:
-            ts  = int(row["timestamp"])
-            prd = row["product"]
-            data[ts][prd] = row
+    with open(f"ROUND_3/prices_round_3_day_{day}.csv") as f:
+        for row in csv.DictReader(f, delimiter=";"):
+            data[int(row["timestamp"])][row["product"]] = row
     return data
 
 
-def row_to_orderbook(row: dict) -> OrderDepth:
+def row_to_od(row: dict) -> OrderDepth:
     od = OrderDepth()
-    for i in ["1", "2", "3"]:
-        bp = row.get(f"bid_price_{i}", "")
-        bv = row.get(f"bid_volume_{i}", "")
-        ap = row.get(f"ask_price_{i}", "")
-        av = row.get(f"ask_volume_{i}", "")
+    for i in ("1", "2", "3"):
+        bp, bv = row.get(f"bid_price_{i}"), row.get(f"bid_volume_{i}")
+        ap, av = row.get(f"ask_price_{i}"), row.get(f"ask_volume_{i}")
         if bp and bv:
-            od.buy_orders[int(float(bp))] = int(float(bv))
+            od.buy_orders[int(float(bp))]  =  int(float(bv))
         if ap and av:
-            od.sell_orders[int(float(ap))] = -int(float(av))  # negative convention
+            od.sell_orders[int(float(ap))] = -int(float(av))
     return od
 
 
-# ── Fill simulation ────────────────────────────────────────────────────────────
+def simulate_fills(orders, od, position, limit):
+    fills, pos = [], position
+    asks = {p: -v for p, v in od.sell_orders.items()}
+    bids = {p:  v for p, v in  od.buy_orders.items()}
 
-def simulate_fills(
-    orders: list[Order],
-    od: OrderDepth,
-    position: int,
-    limit: int,
-) -> tuple[list[tuple[int, int]], int]:
-    """
-    Returns (fills, new_position).
-    fills = list of (price, qty) — qty positive=buy, negative=sell.
-    Respects position limit: skips orders that would breach it.
-    """
-    fills: list[tuple[int, int]] = []
-    pos = position
-
-    # Sort buy orders (highest price first — most aggressive)
-    buy_orders  = sorted([o for o in orders if o.quantity > 0], key=lambda o: -o.price)
-    sell_orders = sorted([o for o in orders if o.quantity < 0], key=lambda o:  o.price)
-
-    # Available market asks (sorted lowest first)
-    market_asks = sorted(od.sell_orders.items())   # (price, neg_vol)
-    market_bids = sorted(od.buy_orders.items(), reverse=True)  # (price, pos_vol)
-
-    ask_avail = {p: -v for p, v in market_asks}   # price -> available qty
-    bid_avail = {p:  v for p, v in market_bids}
-
-    for o in buy_orders:
-        if pos >= limit:
-            break
-        for ask_px in sorted(ask_avail):
-            if ask_px > o.price:
+    for o in sorted([x for x in orders if x.quantity > 0], key=lambda x: -x.price):
+        for px in sorted(asks):
+            if px > o.price or pos >= limit:
                 break
-            can_buy = min(o.quantity, ask_avail[ask_px], limit - pos)
-            if can_buy <= 0:
-                continue
-            fills.append((ask_px, can_buy))
-            pos += can_buy
-            ask_avail[ask_px] -= can_buy
-            o = Order(o.symbol, o.price, o.quantity - can_buy)
+            qty = min(o.quantity, asks[px], limit - pos)
+            if qty > 0:
+                fills.append((px, qty))
+                pos += qty; asks[px] -= qty; o = Order(o.symbol, o.price, o.quantity - qty)
             if o.quantity <= 0:
                 break
 
-    for o in sell_orders:
-        if pos <= -limit:
-            break
-        for bid_px in sorted(bid_avail, reverse=True):
-            if bid_px < o.price:
+    for o in sorted([x for x in orders if x.quantity < 0], key=lambda x: x.price):
+        for px in sorted(bids, reverse=True):
+            if px < o.price or pos <= -limit:
                 break
-            can_sell = min(-o.quantity, bid_avail[bid_px], pos + limit)
-            if can_sell <= 0:
-                continue
-            fills.append((bid_px, -can_sell))
-            pos -= can_sell
-            bid_avail[bid_px] -= can_sell
-            o = Order(o.symbol, o.price, o.quantity + can_sell)
+            qty = min(-o.quantity, bids[px], pos + limit)
+            if qty > 0:
+                fills.append((px, -qty))
+                pos -= qty; bids[px] -= qty; o = Order(o.symbol, o.price, o.quantity + qty)
             if o.quantity >= 0:
                 break
 
     return fills, pos
 
 
-# ── Main backtest loop ─────────────────────────────────────────────────────────
-
-LIMITS = {
-    "HYDROGEL_PACK": 200,
-    "VELVETFRUIT_EXTRACT": 200,
-    **{f"VEV_{k}": 300 for k in [4000, 4500, 5000, 5100, 5200, 5300, 5400, 5500, 6000, 6500]},
-}
-
-
-def run_backtest(days: list[int] = [0, 1, 2], verbose: bool = False):
-    trader = Trader()
+def run_backtest(days=(0, 1, 2)):
+    trader      = Trader()
     trader_data = ""
-
-    positions: dict[str, int] = defaultdict(int)
-    cash: dict[str, float] = defaultdict(float)  # per-product cash (realized)
-    total_fills = defaultdict(int)
-    pnl_history: list[tuple[int, int, float]] = []  # (day, ts, total_pnl)
+    positions   = defaultdict(int)
+    cash        = defaultdict(float)
+    fills_count = defaultdict(int)
+    pnl_log     = []
 
     for day in days:
-        prices = load_prices(day)
-        timestamps = sorted(prices.keys())
+        prices    = load_prices(day)
+        tte_base  = TTE_BY_DAY[day]
+        timestamps = sorted(prices)
+
+        # Inject correct TTE and historical timestamp scale into traderData
+        # The trader reads these via td["tte_base"] and td["tpd"]
+        try:
+            td_dict = json.loads(trader_data) if trader_data else {}
+        except Exception:
+            td_dict = {}
+        td_dict["tte_base"] = tte_base
+        td_dict["tpd"]      = HIST_TPD
+        trader_data = json.dumps(td_dict)
 
         for ts in timestamps:
-            tick_data = prices[ts]
+            tick = prices[ts]
+            ods  = {p: row_to_od(r) for p, r in tick.items()}
 
-            # Build state
-            order_depths = {}
-            for prd, row in tick_data.items():
-                order_depths[prd] = row_to_orderbook(row)
-
-            # Adjust timestamp to be cumulative across days
-            # Prosperity timestamps restart each day; we keep them per-day here
             state = TradingState(
-                traderData=trader_data,
-                timestamp=ts,   # within-day timestamp (0..999900)
-                order_depths=order_depths,
-                position=dict(positions),
+                traderData   = trader_data,
+                timestamp    = ts,
+                order_depths = ods,
+                position     = dict(positions),
             )
 
-            # Run trader
             try:
-                result, _, trader_data = trader.run(state)
+                orders_map, _, trader_data = trader.run(state)
             except Exception as e:
-                print(f"  ERROR at day={day} ts={ts}: {e}")
+                print(f"  ERROR day={day} ts={ts}: {e}")
+                # Re-inject overrides in case traderData was reset
+                try:
+                    td_dict = json.loads(trader_data) if trader_data else {}
+                except Exception:
+                    td_dict = {}
+                td_dict["tte_base"] = tte_base
+                td_dict["tpd"]      = HIST_TPD
+                trader_data = json.dumps(td_dict)
                 continue
 
-            # Simulate fills per product
-            for symbol, orders in result.items():
-                if symbol not in order_depths:
+            # Keep tte_base/tpd in traderData after every tick
+            try:
+                td_dict = json.loads(trader_data)
+            except Exception:
+                td_dict = {}
+            td_dict["tte_base"] = tte_base
+            td_dict["tpd"]      = HIST_TPD
+            trader_data = json.dumps(td_dict)
+
+            for sym, orders in orders_map.items():
+                if sym not in ods:
                     continue
-                od = order_depths[symbol]
-                limit = LIMITS.get(symbol, 200)
                 fills, new_pos = simulate_fills(
-                    orders, od, positions[symbol], limit
-                )
-                positions[symbol] = new_pos
-                for price, qty in fills:
-                    cash[symbol] -= price * qty  # buy=cash out, sell=cash in
-                    total_fills[symbol] += abs(qty)
+                    orders, ods[sym], positions[sym], LIMITS.get(sym, 200))
+                positions[sym] = new_pos
+                for px, qty in fills:
+                    cash[sym]       -= px * qty
+                    fills_count[sym] += abs(qty)
 
-            # Compute total P&L at this tick (realized + unrealized mark-to-market)
-            total_pnl = sum(cash.values())
-            for prd, row in tick_data.items():
-                pos = positions[prd]
-                if pos != 0 and row.get("mid_price"):
-                    total_pnl += pos * float(row["mid_price"])
+            # Mark-to-market PnL
+            mtm = sum(cash.values())
+            for p, row in tick.items():
+                pos = positions[p]
+                if pos and row.get("mid_price"):
+                    mtm += pos * float(row["mid_price"])
+            pnl_log.append((day, ts, mtm))
 
-            pnl_history.append((day, ts, total_pnl))
+        day_pnl = pnl_log[-1][2] if pnl_log else 0
+        print(f"\nEnd of day {day}  (TTE started at {tte_base}d):  PnL = {day_pnl:>10,.0f}")
+        for p in sorted(positions):
+            if positions[p]:
+                print(f"  {p:<28} pos={positions[p]:>5}")
 
-            if verbose and ts % 10000 == 0:
-                print(f"  day={day} ts={ts:>7}  pnl={total_pnl:>10.0f}  "
-                      f"pos_VEV={positions.get('VELVETFRUIT_EXTRACT',0):>4}  "
-                      f"pos_HYD={positions.get('HYDROGEL_PACK',0):>4}")
+    # Summary
+    print("\n" + "═"*60)
+    final = pnl_log[-1][2] if pnl_log else 0
+    print(f"TOTAL PnL  :  {final:>12,.2f}")
+    print("\nFills:")
+    for p in sorted(fills_count):
+        print(f"  {p:<28} {fills_count[p]:>6} units")
+    print("\nPer-product realized cash:")
+    for p in sorted(cash):
+        if cash[p]:
+            print(f"  {p:<28} {cash[p]:>12,.2f}")
 
-        # End-of-day summary
-        day_pnl = pnl_history[-1][2] if pnl_history else 0
-        print(f"\nEnd of day {day}:  PnL = {day_pnl:>10,.0f}")
-        for prd in sorted(positions):
-            if positions[prd] != 0:
-                print(f"  {prd:<28} pos={positions[prd]:>5}")
-
-    # ── Final report ──────────────────────────────────────────────────────────
-    print("\n" + "═" * 60)
-    print("FINAL BACKTEST SUMMARY")
-    print("═" * 60)
-
-    final_pnl = pnl_history[-1][2] if pnl_history else 0
-    print(f"Total PnL            : {final_pnl:>12,.2f}")
-
-    print("\nFills per product:")
-    for prd in sorted(total_fills):
-        print(f"  {prd:<28} {total_fills[prd]:>6} units traded")
-
-    print("\nFinal positions:")
-    for prd in sorted(positions):
-        pos = positions[prd]
-        if pos != 0:
-            print(f"  {prd:<28} {pos:>5}")
-
-    # Per-product realized P&L
-    print("\nPer-product realized cash (excl. open positions):")
-    for prd in sorted(cash):
-        if cash[prd] != 0:
-            print(f"  {prd:<28} {cash[prd]:>10,.2f}")
-
-    # P&L breakdown by day
-    print("\nPnL progression (sampled every 10000 ticks):")
+    print("\nPnL over time (every 100k ts):")
     prev = 0.0
-    for day, ts, pnl in pnl_history:
-        if ts % 10000 == 0:
-            delta = pnl - prev
-            print(f"  day={day} ts={ts:>7}  cumulative={pnl:>10,.0f}  "
-                  f"delta={delta:>+8,.0f}")
+    for day, ts, pnl in pnl_log:
+        if ts % 100_000 == 0:
+            print(f"  day={day} ts={ts:>7}  cum={pnl:>10,.0f}  Δ={pnl-prev:>+9,.0f}")
             prev = pnl
 
-    return pnl_history, positions, cash
+    return pnl_log, positions, cash
 
 
 if __name__ == "__main__":
-    import sys
-    verbose = "--verbose" in sys.argv or "-v" in sys.argv
-    run_backtest(days=[0, 1, 2], verbose=verbose)
+    run_backtest()
